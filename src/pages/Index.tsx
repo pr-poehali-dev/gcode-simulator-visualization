@@ -17,6 +17,9 @@ interface ToolPath {
   type: "rapid" | "cut" | "arc" | "probe";
   lineNum: number;
   feedrate?: number;
+  // arc-specific
+  arcCx?: number; arcCy?: number; arcR?: number;
+  arcStartAngle?: number; arcEndAngle?: number; arcCCW?: boolean;
 }
 
 interface ParseResult {
@@ -35,6 +38,12 @@ interface ParseResult {
     boundingBox: { minX: number; maxX: number; minY: number; maxY: number };
     feedrates: number[];
     dialect: string;
+    // extracted from code
+    spindleSpeeds: number[];
+    tools: number[];
+    plungeFeed: number | null;
+    cuttingFeed: number | null;
+    rapidFeed: number | null;
   };
 }
 
@@ -55,13 +64,17 @@ function parseGCode(code: string): ParseResult {
   const paths: ToolPath[] = [];
 
   let pos = { x: 0, y: 0, z: 0 };
-  const modal = { motion: "G0", coords: "G90" };
+  const modal = { motion: "G0", coords: "G90", arcCCW: false };
   let feedrate = 300;
   const feedrates: number[] = [];
+  const spindleSpeeds: number[] = [];
+  const tools: number[] = [];
   let rapidDist = 0, cutDist = 0;
   let maxDepth = 0;
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   let rapidMoves = 0, cutMoves = 0, arcs = 0;
+  let firstPlungeFeed: number | null = null;
+  let maxCuttingFeed: number | null = null;
 
   const dist3 = (a: typeof pos, b: typeof pos) =>
     Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2);
@@ -83,9 +96,22 @@ function parseGCode(code: string): ParseResult {
 
     if (command === "G0" || command === "G00") modal.motion = "G0";
     if (command === "G1" || command === "G01") modal.motion = "G1";
+    if (command === "G2" || command === "G02") { modal.motion = "G2"; modal.arcCCW = false; }
+    if (command === "G3" || command === "G03") { modal.motion = "G3"; modal.arcCCW = true; }
     if (command === "G90") modal.coords = "G90";
     if (command === "G91") modal.coords = "G91";
-    if (params.F) { feedrate = params.F; if (!feedrates.includes(feedrate)) feedrates.push(feedrate); }
+
+    if (params.F) {
+      feedrate = params.F;
+      if (!feedrates.includes(feedrate)) feedrates.push(feedrate);
+      // detect plunge vs cutting feed by Z motion
+      if (params.Z !== undefined && params.Z < pos.z && firstPlungeFeed === null) firstPlungeFeed = feedrate;
+      if (params.X !== undefined || params.Y !== undefined) {
+        if (maxCuttingFeed === null || feedrate > maxCuttingFeed) maxCuttingFeed = feedrate;
+      }
+    }
+    if (params.S && params.S > 0 && !spindleSpeeds.includes(params.S)) spindleSpeeds.push(params.S);
+    if (params.T && params.T > 0 && !tools.includes(params.T)) tools.push(params.T);
 
     const newPos = {
       x: params.X !== undefined ? (modal.coords === "G90" ? params.X : pos.x + params.X) : pos.x,
@@ -98,27 +124,43 @@ function parseGCode(code: string): ParseResult {
 
     if (isComment || !command) {
       type = "comment";
-    } else if (command.match(/^G0/) && !command.match(/^G0[23]/)) {
+    } else if ((command === "G0" || command === "G00") || (modal.motion === "G0" && hasMotion && !command.match(/^G[123]/))) {
       type = "rapid";
       if (hasMotion) {
         rapidDist += dist3(pos, newPos);
         rapidMoves++;
         paths.push({ from: { ...pos }, to: { ...newPos }, type: "rapid", lineNum: i + 1, feedrate });
       }
-    } else if (command.match(/^G1/)) {
+    } else if (command === "G1" || command === "G01" || (modal.motion === "G1" && hasMotion && !command.match(/^G[023]/))) {
       type = "cut";
       if (hasMotion) {
         cutDist += dist3(pos, newPos);
         cutMoves++;
         paths.push({ from: { ...pos }, to: { ...newPos }, type: "cut", lineNum: i + 1, feedrate });
       }
-    } else if (command.match(/^G[23]/)) {
+    } else if (command.match(/^G0?[23]$/)) {
       type = "arc";
-      if (hasMotion) {
+      const isCCW = command === "G3" || command === "G03";
+      if (hasMotion || params.I !== undefined || params.J !== undefined) {
+        // Arc center relative to start position
+        const cx = pos.x + (params.I ?? 0);
+        const cy = pos.y + (params.J ?? 0);
+        const r = Math.sqrt((pos.x - cx) ** 2 + (pos.y - cy) ** 2);
+        const startAngle = Math.atan2(pos.y - cy, pos.x - cx);
+        const endAngle = Math.atan2(newPos.y - cy, newPos.x - cx);
+        // Approximate arc length
+        let dAngle = isCCW ? endAngle - startAngle : startAngle - endAngle;
+        if (dAngle <= 0) dAngle += Math.PI * 2;
+        // Full circle when start == end
+        if (params.X === undefined && params.Y === undefined) dAngle = Math.PI * 2;
+        cutDist += r * dAngle;
         arcs++;
-        paths.push({ from: { ...pos }, to: { ...newPos }, type: "arc", lineNum: i + 1, feedrate });
+        paths.push({
+          from: { ...pos }, to: { ...newPos }, type: "arc", lineNum: i + 1, feedrate,
+          arcCx: cx, arcCy: cy, arcR: r, arcStartAngle: startAngle, arcEndAngle: endAngle, arcCCW: isCCW,
+        });
       }
-    } else if (command === "G38" || command === "G38.2") {
+    } else if (command.startsWith("G38")) {
       type = "probe";
     }
 
@@ -134,7 +176,8 @@ function parseGCode(code: string): ParseResult {
 
   const totalDist = rapidDist + cutDist;
   const avgFeed = feedrates.length ? feedrates.reduce((a, b) => a + b, 0) / feedrates.length : 300;
-  const estimatedTime = (cutDist / avgFeed) + (rapidDist / 3000);
+  const rapidSpeed = 3000;
+  const estimatedTime = (cutDist / Math.max(1, avgFeed)) + (rapidDist / rapidSpeed);
 
   return {
     lines,
@@ -153,6 +196,11 @@ function parseGCode(code: string): ParseResult {
       },
       feedrates: feedrates.sort((a, b) => a - b),
       dialect: detectDialect(code),
+      spindleSpeeds: spindleSpeeds.sort((a, b) => a - b),
+      tools: tools.sort((a, b) => a - b),
+      plungeFeed: firstPlungeFeed,
+      cuttingFeed: maxCuttingFeed,
+      rapidFeed: 3000,
     },
   };
 }
@@ -292,25 +340,48 @@ function Visualizer({ paths, stats, activeLine }: VisualizerProps) {
       const from = toScreen(path.from.x, path.from.y);
       const to = toScreen(path.to.x, path.to.y);
 
-      ctx.beginPath();
-      ctx.moveTo(from.sx, from.sy);
-
       if (path.type === "arc") {
-        const midX = (from.sx + to.sx) / 2 + (to.sy - from.sy) * 0.3;
-        const midY = (from.sy + to.sy) / 2 - (to.sx - from.sx) * 0.3;
-        ctx.quadraticCurveTo(midX, midY, to.sx, to.sy);
-        ctx.strokeStyle = isActive ? "#80d8ff" : "rgba(79,195,247,0.75)";
+        ctx.strokeStyle = isActive ? "#80d8ff" : "rgba(79,195,247,0.8)";
         ctx.lineWidth = isActive ? 2.5 : 1.5;
+        if (path.arcCx !== undefined && path.arcCy !== undefined && path.arcR !== undefined && path.arcR > 0) {
+          const screenCx = cx + path.arcCx * scale;
+          const screenCy = cy - path.arcCy * scale;
+          const screenR = path.arcR * scale;
+          const startA = path.arcStartAngle ?? 0;
+          const endA = path.arcEndAngle ?? 0;
+          const isCCW = path.arcCCW ?? false;
+          const isFullCircle =
+            Math.abs(path.from.x - path.to.x) < 0.001 &&
+            Math.abs(path.from.y - path.to.y) < 0.001;
+          ctx.beginPath();
+          if (isFullCircle) {
+            ctx.arc(screenCx, screenCy, screenR, 0, Math.PI * 2);
+          } else {
+            ctx.arc(screenCx, screenCy, screenR, -startA, -endA, isCCW);
+          }
+        } else {
+          const midX = (from.sx + to.sx) / 2 + (to.sy - from.sy) * 0.3;
+          const midY = (from.sy + to.sy) / 2 - (to.sx - from.sx) * 0.3;
+          ctx.beginPath();
+          ctx.moveTo(from.sx, from.sy);
+          ctx.quadraticCurveTo(midX, midY, to.sx, to.sy);
+        }
       } else if (path.type === "rapid") {
+        ctx.beginPath();
+        ctx.moveTo(from.sx, from.sy);
         ctx.lineTo(to.sx, to.sy);
         ctx.strokeStyle = isActive ? "#ffd740" : "rgba(255,179,0,0.5)";
         ctx.lineWidth = isActive ? 2 : 0.8;
         ctx.setLineDash([5, 4]);
       } else if (path.type === "cut") {
+        ctx.beginPath();
+        ctx.moveTo(from.sx, from.sy);
         ctx.lineTo(to.sx, to.sy);
         ctx.strokeStyle = isActive ? "#69ffca" : "rgba(0,229,160,0.9)";
         ctx.lineWidth = isActive ? 2.5 : 1.5;
       } else {
+        ctx.beginPath();
+        ctx.moveTo(from.sx, from.sy);
         ctx.lineTo(to.sx, to.sy);
         ctx.strokeStyle = "rgba(206,147,216,0.7)";
         ctx.lineWidth = 1;
@@ -613,11 +684,30 @@ export default function Index() {
             <div className="w-60 flex-none border-l border-white/[0.07] flex flex-col bg-[#060910]">
               <div className="p-4 border-b border-white/[0.07]">
                 <div className="text-[9px] font-mono text-white/25 uppercase tracking-wider mb-3">Загрузка файла</div>
-                <button onClick={() => fileInputRef.current?.click()}
-                  className="w-full h-16 border border-dashed border-white/12 hover:border-emerald-500/35 flex flex-col items-center justify-center gap-2 transition-all group">
-                  <Icon name="FileUp" size={18} className="text-white/22 group-hover:text-emerald-400 transition-colors" />
-                  <span className="text-[9px] font-mono text-white/25 group-hover:text-white/50 transition-colors">.nc .gcode .ngc .tap</span>
-                </button>
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  onDragOver={e => { e.preventDefault(); e.currentTarget.classList.add("border-emerald-500/60"); }}
+                  onDragLeave={e => { e.currentTarget.classList.remove("border-emerald-500/60"); }}
+                  onDrop={e => {
+                    e.preventDefault();
+                    e.currentTarget.classList.remove("border-emerald-500/60");
+                    const file = e.dataTransfer.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = ev => {
+                      const text = ev.target?.result as string;
+                      setGCode(text);
+                      setParsed(parseGCode(text));
+                      setActiveTab("visual");
+                    };
+                    reader.readAsText(file);
+                  }}
+                  className="w-full h-20 border border-dashed border-white/12 hover:border-emerald-500/35 flex flex-col items-center justify-center gap-2 transition-all group cursor-pointer select-none">
+                  <Icon name="FileUp" size={20} className="text-white/22 group-hover:text-emerald-400 transition-colors" />
+                  <span className="text-[9px] font-mono text-white/25 group-hover:text-white/50 transition-colors text-center leading-relaxed">
+                    Клик или перетащи файл<br/>.nc .gcode .ngc .tap .cnc
+                  </span>
+                </div>
               </div>
 
               <div className="p-4 border-b border-white/[0.07]">
@@ -661,54 +751,100 @@ export default function Index() {
         {/* ─ PARAMS ─ */}
         {activeTab === "params" && (
           <div className="h-full overflow-y-auto p-6">
-            <div className="max-w-2xl mx-auto space-y-4 animate-fade-in">
-              <div className="text-[9px] font-mono text-white/25 uppercase tracking-wider mb-5">Параметры станка и инструмента</div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {[
-                  { title: "Рабочая зона", color: "emerald", fields: [
-                    { l: "Ось X", u: "мм", v: "600" }, { l: "Ось Y", u: "мм", v: "400" },
-                    { l: "Ось Z", u: "мм", v: "100" }, { l: "Max подача", u: "мм/мин", v: "10000" },
-                  ]},
-                  { title: "Инструмент", color: "amber", fields: [
-                    { l: "Диаметр фрезы", u: "мм", v: "6" }, { l: "Число зубьев", u: "шт", v: "4" },
-                    { l: "Шпиндель", u: "об/мин", v: "12000" }, { l: "Подача/зуб", u: "мм", v: "0.05" },
-                  ]},
-                  { title: "Симуляция", color: "sky", fields: [
-                    { l: "Скорость G00", u: "мм/мин", v: "3000" }, { l: "Смена инструм.", u: "сек", v: "10" },
-                    { l: "Разгон", u: "мм/с²", v: "500" }, { l: "Задержка старта", u: "мс", v: "100" },
-                  ]},
-                  { title: "Материал", color: "purple", fields: [] as { l: string; u: string; v: string }[] },
-                ].map(section => (
-                  <div key={section.title} className="border border-white/[0.07] p-4 bg-[#060910]">
-                    <div className={`text-[9px] font-mono text-${section.color}-400/65 uppercase tracking-wider mb-3`}>
-                      {section.title}
+            <div className="max-w-2xl mx-auto space-y-3 animate-fade-in">
+              <div className="text-[9px] font-mono text-white/25 uppercase tracking-wider mb-4">
+                Параметры из G-code {s ? `· ${s.dialect}` : ""}
+              </div>
+
+              {!s ? (
+                <div className="text-white/25 font-mono text-sm text-center py-12">Загрузите G-code</div>
+              ) : (
+                <>
+                  {/* From code — read only */}
+                  <div className="border border-emerald-500/20 p-4 bg-emerald-400/[0.02]">
+                    <div className="text-[9px] font-mono text-emerald-400/60 uppercase tracking-wider mb-3 flex items-center gap-2">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>
+                      Извлечено из кода
                     </div>
-                    {section.title === "Материал" ? (
-                      <div className="grid grid-cols-2 gap-1">
-                        {["Алюминий", "Сталь", "Нерж.", "Бронза", "Дерево", "Пластик"].map((m, i) => (
-                          <button key={m} className={`px-2 py-1.5 text-[10px] font-mono border-l-2 text-left transition-all
-                            ${i === 0 ? "border-purple-400 text-purple-400 bg-purple-400/5" : "border-transparent text-white/30 hover:text-white/55 hover:bg-white/[0.02]"}`}>
-                            {m}
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
+                    <div className="grid grid-cols-2 gap-x-8 gap-y-2">
+                      {[
+                        { l: "Подача врезания", v: s.plungeFeed ? `${s.plungeFeed} мм/мин` : "—", c: "text-sky-400" },
+                        { l: "Подача резания", v: s.cuttingFeed ? `${s.cuttingFeed} мм/мин` : "—", c: "text-emerald-400" },
+                        { l: "Скорость шпинделя", v: s.spindleSpeeds.length ? `${s.spindleSpeeds.join(", ")} об/мин` : "—", c: "text-amber-400" },
+                        { l: "Инструменты (T)", v: s.tools.length ? s.tools.map(t => `T${t.toString().padStart(2,"0")}`).join(", ") : "—", c: "text-purple-400" },
+                        { l: "Макс. глубина Z", v: `${Math.abs(s.maxDepth).toFixed(3)} мм`, c: "text-red-400" },
+                        { l: "Все подачи F", v: s.feedrates.length ? s.feedrates.join(", ") : "—", c: "text-white/60" },
+                        { l: "Рабочая зона X", v: `${s.boundingBox.minX.toFixed(1)} → ${s.boundingBox.maxX.toFixed(1)} мм`, c: "text-white/60" },
+                        { l: "Рабочая зона Y", v: `${s.boundingBox.minY.toFixed(1)} → ${s.boundingBox.maxY.toFixed(1)} мм`, c: "text-white/60" },
+                      ].map(row => (
+                        <div key={row.l} className="flex flex-col gap-0.5">
+                          <span className="text-[9px] font-mono text-white/25 uppercase">{row.l}</span>
+                          <span className={`text-[11px] font-mono ${row.c}`}>{row.v}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Feedrates visual */}
+                  {s.feedrates.length > 0 && (
+                    <div className="border border-white/[0.07] p-4 bg-[#060910]">
+                      <div className="text-[9px] font-mono text-white/25 uppercase tracking-wider mb-3">Подачи F в программе</div>
                       <div className="space-y-2">
-                        {section.fields.map(f => (
-                          <div key={f.l} className="flex items-center justify-between gap-2">
-                            <label className="text-[10px] font-mono text-white/35 flex-1 truncate">{f.l}</label>
-                            <div className="flex items-center gap-1 flex-none">
-                              <input defaultValue={f.v}
-                                className={`w-16 bg-[#0d1118] border border-white/8 px-2 py-0.5 text-[10px] font-mono text-white/75 outline-none focus:border-${section.color}-500/35 text-right`} />
-                              <span className="text-[9px] font-mono text-white/20 w-8 truncate">{f.u}</span>
+                        {s.feedrates.map(f => {
+                          const isPlunge = f === s.plungeFeed;
+                          const isCut = f === s.cuttingFeed;
+                          return (
+                            <div key={f} className="flex items-center gap-3">
+                              <span className={`text-[10px] font-mono w-28 ${isPlunge ? "text-sky-400" : isCut ? "text-emerald-400" : "text-amber-400"}`}>
+                                {f} мм/мин
+                              </span>
+                              <div className="flex-1 h-[3px] bg-white/[0.04]">
+                                <div className="h-full" style={{
+                                  width: `${(f / Math.max(...s.feedrates)) * 100}%`,
+                                  background: isPlunge ? "#4fc3f7" : isCut ? "#00e5a0" : "#ffb300",
+                                  opacity: 0.65
+                                }}></div>
+                              </div>
+                              <span className="text-[9px] font-mono text-white/20 w-16 text-right">
+                                {isPlunge ? "врезание" : isCut ? "резание" : ""}
+                              </span>
                             </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Spindle speeds */}
+                  {s.spindleSpeeds.length > 0 && (
+                    <div className="border border-white/[0.07] p-4 bg-[#060910]">
+                      <div className="text-[9px] font-mono text-white/25 uppercase tracking-wider mb-3">Скорости шпинделя (S)</div>
+                      <div className="flex gap-3 flex-wrap">
+                        {s.spindleSpeeds.map(sp => (
+                          <div key={sp} className="flex flex-col items-center px-4 py-2 border border-amber-500/20 bg-amber-400/[0.04]">
+                            <span className="font-display text-lg font-semibold text-amber-400">{sp.toLocaleString()}</span>
+                            <span className="text-[9px] font-mono text-white/25">об/мин</span>
                           </div>
                         ))}
                       </div>
-                    )}
-                  </div>
-                ))}
-              </div>
+                    </div>
+                  )}
+
+                  {/* Tools */}
+                  {s.tools.length > 0 && (
+                    <div className="border border-white/[0.07] p-4 bg-[#060910]">
+                      <div className="text-[9px] font-mono text-white/25 uppercase tracking-wider mb-3">Инструменты (T)</div>
+                      <div className="flex gap-2 flex-wrap">
+                        {s.tools.map(t => (
+                          <div key={t} className="flex items-center gap-2 px-3 py-1.5 border border-purple-500/20 bg-purple-400/[0.04]">
+                            <span className="text-[10px] font-mono text-purple-400">T{t.toString().padStart(2, "0")}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
             </div>
           </div>
         )}
