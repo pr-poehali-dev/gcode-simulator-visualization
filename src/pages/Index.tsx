@@ -49,12 +49,15 @@ interface ParseResult {
 
 // ─── G-Code Parser ────────────────────────────────────────────────────────────
 function detectDialect(code: string): string {
-  if (/HAAS/i.test(code) || /Q\d+\s+R\d+/i.test(code)) return "Haas CNC";
+  if (/ArtCAM/i.test(code) || /G71/.test(code) && /N\d+G\d+/.test(code)) return "ArtCAM";
+  if (/HAAS/i.test(code)) return "Haas CNC";
   if (/FANUC/i.test(code) || /\(FANUC/i.test(code)) return "Fanuc";
   if (/;MACH3/i.test(code) || /\(Mach3/i.test(code)) return "Mach3";
   if (/GRBL/i.test(code) || /\$H/i.test(code)) return "GRBL";
   if (/LinuxCNC/i.test(code)) return "LinuxCNC";
   if (/Marlin/i.test(code) || /M104/i.test(code)) return "Marlin 3D";
+  // Detect N-numbered lines (Fanuc-style or ArtCAM)
+  if (/^N\d+/m.test(code)) return "Fanuc / ArtCAM";
   return "G-code (Generic)";
 }
 
@@ -80,31 +83,65 @@ function parseGCode(code: string): ParseResult {
     Math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2);
 
   for (let i = 0; i < rawLines.length; i++) {
-    const raw = rawLines[i].trim();
+    let raw = rawLines[i].trim();
     if (!raw) continue;
 
-    const isComment = /^[;(]/.test(raw);
+    // Strip inline comments: (text) and ;text
+    raw = raw.replace(/\([^)]*\)/g, " ").replace(/;.*$/, "").trim();
+    if (!raw) continue;
+
+    // Strip line numbers: N0, N10, N100 etc (at start of line)
+    const stripped = raw.replace(/^N\d+\s*/i, "");
+
+    const isComment = /^[;(%]/.test(raw);
+
+    // Parse ALL word-address params from the stripped line
     const params: Record<string, number> = {};
     const paramPattern = /([A-Za-z])([+-]?\d+\.?\d*)/g;
     let m;
-    while ((m = paramPattern.exec(raw)) !== null) {
-      params[m[1].toUpperCase()] = parseFloat(m[2]);
+    while ((m = paramPattern.exec(stripped)) !== null) {
+      const letter = m[1].toUpperCase();
+      // Skip N (line numbers) and already-used letters
+      if (letter === "N") continue;
+      params[letter] = parseFloat(m[2]);
     }
 
-    const commandMatch = raw.match(/([GM]\d+\.?\d*)/i);
-    const command = commandMatch ? commandMatch[1].toUpperCase() : "";
+    // Find ALL G-codes on this line (ArtCAM puts multiple: N0G00 G21 G17 G90)
+    const gcodes: string[] = [];
+    const gcodePattern = /G(\d+\.?\d*)/gi;
+    let gm;
+    while ((gm = gcodePattern.exec(stripped)) !== null) {
+      gcodes.push("G" + parseInt(gm[1]).toString().padStart(2, "0").replace(/^G0(\d)$/, "G0$1"));
+    }
+    // Normalize: G00→G0, G01→G1, etc but keep as canonical string
+    const normalizeG = (g: string) => {
+      const n = parseInt(g.slice(1));
+      return "G" + n;
+    };
+    const gcodeNorm = gcodes.map(normalizeG);
 
-    if (command === "G0" || command === "G00") modal.motion = "G0";
-    if (command === "G1" || command === "G01") modal.motion = "G1";
-    if (command === "G2" || command === "G02") { modal.motion = "G2"; modal.arcCCW = false; }
-    if (command === "G3" || command === "G03") { modal.motion = "G3"; modal.arcCCW = true; }
-    if (command === "G90") modal.coords = "G90";
-    if (command === "G91") modal.coords = "G91";
+    // Find M-codes
+    const mcodes: string[] = [];
+    const mcodePattern = /M(\d+)/gi;
+    while ((gm = mcodePattern.exec(stripped)) !== null) {
+      mcodes.push("M" + parseInt(gm[1]));
+    }
 
+    // Update modal state from all G-codes on this line
+    for (const g of gcodeNorm) {
+      if (g === "G0") modal.motion = "G0";
+      else if (g === "G1") modal.motion = "G1";
+      else if (g === "G2") { modal.motion = "G2"; modal.arcCCW = false; }
+      else if (g === "G3") { modal.motion = "G3"; modal.arcCCW = true; }
+      else if (g === "G90") modal.coords = "G90";
+      else if (g === "G91") modal.coords = "G91";
+      // G71 = metric (same as G21), G70 = inch (same as G20)
+    }
+
+    // Update feedrate, spindle, tool
     if (params.F) {
       feedrate = params.F;
       if (!feedrates.includes(feedrate)) feedrates.push(feedrate);
-      // detect plunge vs cutting feed by Z motion
       if (params.Z !== undefined && params.Z < pos.z && firstPlungeFeed === null) firstPlungeFeed = feedrate;
       if (params.X !== undefined || params.Y !== undefined) {
         if (maxCuttingFeed === null || feedrate > maxCuttingFeed) maxCuttingFeed = feedrate;
@@ -122,56 +159,67 @@ function parseGCode(code: string): ParseResult {
     let type: GCodeLine["type"] = "other";
     const hasMotion = params.X !== undefined || params.Y !== undefined || params.Z !== undefined;
 
-    if (isComment || !command) {
+    // Determine move type:
+    // Priority: explicit G on this line > modal
+    const hasG0 = gcodeNorm.includes("G0");
+    const hasG1 = gcodeNorm.includes("G1");
+    const hasG2 = gcodeNorm.includes("G2");
+    const hasG3 = gcodeNorm.includes("G3");
+
+    if (isComment) {
       type = "comment";
-    } else if ((command === "G0" || command === "G00") || (modal.motion === "G0" && hasMotion && !command.match(/^G[123]/))) {
-      type = "rapid";
-      if (hasMotion) {
-        rapidDist += dist3(pos, newPos);
-        rapidMoves++;
-        paths.push({ from: { ...pos }, to: { ...newPos }, type: "rapid", lineNum: i + 1, feedrate });
+    } else if (hasG2 || hasG3 || modal.motion === "G2" || modal.motion === "G3") {
+      // Arc — only if there's actual motion params
+      if (hasMotion || params.I !== undefined || params.J !== undefined) {
+        type = "arc";
+        const isCCW = hasG3 || (!hasG2 && modal.motion === "G3");
+        const arcCx = pos.x + (params.I ?? 0);
+        const arcCy = pos.y + (params.J ?? 0);
+        const arcR = Math.sqrt((pos.x - arcCx) ** 2 + (pos.y - arcCy) ** 2);
+        const startAngle = Math.atan2(pos.y - arcCy, pos.x - arcCx);
+        const endAngle = Math.atan2(newPos.y - arcCy, newPos.x - arcCx);
+        let dAngle = isCCW ? endAngle - startAngle : startAngle - endAngle;
+        if (dAngle <= 0) dAngle += Math.PI * 2;
+        if (params.X === undefined && params.Y === undefined) dAngle = Math.PI * 2;
+        cutDist += arcR * dAngle;
+        arcs++;
+        paths.push({
+          from: { ...pos }, to: { ...newPos }, type: "arc", lineNum: i + 1, feedrate,
+          arcCx, arcCy, arcR, arcStartAngle: startAngle, arcEndAngle: endAngle, arcCCW: isCCW,
+        });
       }
-    } else if (command === "G1" || command === "G01" || (modal.motion === "G1" && hasMotion && !command.match(/^G[023]/))) {
+    } else if (hasG1 || (!hasG0 && !hasG2 && !hasG3 && modal.motion === "G1" && hasMotion)) {
+      // Linear cut
       type = "cut";
       if (hasMotion) {
         cutDist += dist3(pos, newPos);
         cutMoves++;
         paths.push({ from: { ...pos }, to: { ...newPos }, type: "cut", lineNum: i + 1, feedrate });
       }
-    } else if (command.match(/^G0?[23]$/)) {
-      type = "arc";
-      const isCCW = command === "G3" || command === "G03";
-      if (hasMotion || params.I !== undefined || params.J !== undefined) {
-        // Arc center relative to start position
-        const cx = pos.x + (params.I ?? 0);
-        const cy = pos.y + (params.J ?? 0);
-        const r = Math.sqrt((pos.x - cx) ** 2 + (pos.y - cy) ** 2);
-        const startAngle = Math.atan2(pos.y - cy, pos.x - cx);
-        const endAngle = Math.atan2(newPos.y - cy, newPos.x - cx);
-        // Approximate arc length
-        let dAngle = isCCW ? endAngle - startAngle : startAngle - endAngle;
-        if (dAngle <= 0) dAngle += Math.PI * 2;
-        // Full circle when start == end
-        if (params.X === undefined && params.Y === undefined) dAngle = Math.PI * 2;
-        cutDist += r * dAngle;
-        arcs++;
-        paths.push({
-          from: { ...pos }, to: { ...newPos }, type: "arc", lineNum: i + 1, feedrate,
-          arcCx: cx, arcCy: cy, arcR: r, arcStartAngle: startAngle, arcEndAngle: endAngle, arcCCW: isCCW,
-        });
+    } else if (hasG0 || (!hasG1 && !hasG2 && !hasG3 && modal.motion === "G0" && hasMotion)) {
+      // Rapid
+      type = "rapid";
+      if (hasMotion) {
+        rapidDist += dist3(pos, newPos);
+        rapidMoves++;
+        paths.push({ from: { ...pos }, to: { ...newPos }, type: "rapid", lineNum: i + 1, feedrate });
       }
-    } else if (command.startsWith("G38")) {
+    } else if (stripped.match(/^G38/i)) {
       type = "probe";
     }
 
-    if (hasMotion && type !== "comment") {
+    if (hasMotion) {
       if (newPos.z < maxDepth) maxDepth = newPos.z;
-      minX = Math.min(minX, newPos.x); maxX = Math.max(maxX, newPos.x);
-      minY = Math.min(minY, newPos.y); maxY = Math.max(maxY, newPos.y);
+      if (type !== "comment" && type !== "other") {
+        minX = Math.min(minX, newPos.x); maxX = Math.max(maxX, newPos.x);
+        minY = Math.min(minY, newPos.y); maxY = Math.max(maxY, newPos.y);
+      }
       pos = newPos;
     }
 
-    lines.push({ lineNum: i + 1, raw, command, params, type });
+    // Determine display command label
+    const displayCmd = gcodeNorm[0] || mcodes[0] || "";
+    lines.push({ lineNum: i + 1, raw: rawLines[i].trim(), command: displayCmd, params, type });
   }
 
   const totalDist = rapidDist + cutDist;
@@ -206,53 +254,37 @@ function parseGCode(code: string): ParseResult {
 }
 
 // ─── Demo G-code ─────────────────────────────────────────────────────────────
-const DEMO_GCODE = `; GCode Simulator — Demo Program
-; Dialect: Generic CNC / Fanuc compatible
-; Tool: End Mill D6mm
-
-G21 G17 G90 G94
-G28 G91 Z0
-G90
-
-T01 M06
-M03 S12000
-
-G00 X0 Y0 Z5
-G00 X10 Y10 Z5
-G01 Z-2 F200
-
-; Square contour
-G01 X90 Y10 F800
-G01 X90 Y90 F800
-G01 X10 Y90 F800
-G01 X10 Y10 F800
-
-; Circular pocket
-G00 Z2
-G00 X50 Y50
-G01 Z-3 F150
-G02 X50 Y50 I20 J0 F600
-
-; Inner circle
-G01 Z-5 F100
-G02 X50 Y50 I10 J0 F400
-
-; Diagonal cuts
-G00 Z2
-G01 Z-1 F200
-G01 X30 Y30 F600
-G01 X70 Y70 F600
-G00 Z2
-G01 X70 Y30 Z-1 F200
-G01 X30 Y70 F600
-
-; Probe sequence
-G38.2 Z-10 F50
-
-G00 Z10
-G00 X0 Y0
-M05
-M30`;
+const DEMO_GCODE = `N0G00 G21 G17 G90
+N10G00 G40 G49 G80
+N20G71
+N30T8M6
+N40G43Z50.000H1M8
+S18000M03
+X0.000Y0.000
+N70G00X10.000Y10.000Z50.000
+N80G01Z-2.000F800.0
+N90G01Y90.000F5000.0
+N100X90.000
+N110G01Y10.000
+N120X10.000
+N130G00Z50.000
+N140G00X50.000Y50.000
+N150G01Z-3.000F800.0
+N160G02X50.000Y50.000I20.000J0.000F4000.0
+N170G01Z-5.000F500.0
+N180G02X50.000Y50.000I10.000J0.000F3000.0
+N190G00Z50.000
+N200G00X30.000Y30.000
+N210G01Z-1.000F800.0
+N220G01X70.000Y70.000F5000.0
+N230G00Z50.000
+N240G00X70.000Y30.000
+N250G01Z-1.000F800.0
+N260G01X30.000Y70.000F5000.0
+N270G00Z50.000
+N280G00X0.000Y0.000
+N290M09
+N300M30`;
 
 // ─── Canvas Visualizer ────────────────────────────────────────────────────────
 interface VisualizerProps {
