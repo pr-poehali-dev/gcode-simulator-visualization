@@ -479,7 +479,22 @@ function Visualizer({ paths, stats, activeLine }: VisualizerProps) {
 
   const handleWheel = (e: React.WheelEvent) => {
     e.preventDefault();
-    setZoom(z => Math.max(0.1, Math.min(20, z * (e.deltaY > 0 ? 0.85 : 1.15))));
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    // Cursor position relative to canvas
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    const factor = e.deltaY > 0 ? 0.85 : 1.15;
+    // Zoom toward cursor: pan adjusts so the world point under cursor stays fixed
+    setZoom(z => {
+      const newZoom = Math.max(0.1, Math.min(20, z * factor));
+      setPan(p => ({
+        x: mouseX - (mouseX - p.x) * (newZoom / z),
+        y: mouseY - (mouseY - p.y) * (newZoom / z),
+      }));
+      return newZoom;
+    });
   };
 
   return (
